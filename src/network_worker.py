@@ -175,10 +175,10 @@ class NetworkWorker(QObject):
                     # Переустанавливаем таймаут для TLS-фазы
                     sock.settimeout(self._timeout)
                     ssock = ctx.wrap_socket(sock, server_hostname=host)
-                    # Общее время = TCP + TLS
-                    total_ms = (time.time() - start_time) * 1000
                     ssock.close()
-                    return "online", round(total_ms, 1)
+                    # Пинг = только TCP (сетевая задержка),
+                    # TLS — лишь проверка, не влияет на отображение
+                    return "online", round(tcp_ms, 1)
 
                 except (ssl.SSLError, ssl.SSLCertVerificationError):
                     # TLS ошибка: DPI сбросил соединение на этапе
