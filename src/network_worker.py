@@ -16,9 +16,32 @@
 #
 # emit() — безопасно отправляет данные между потоками.
 # Qt сам позаботится о том, чтобы слот вызвался в правильном потоке.
+#
+# ПРОВЕРКА ДОСТУПНОСТИ — 2 уровня:
+# ─────────────────────────────────────────────────────────
+# Для порта 443 (HTTPS) используется двухуровневая проверка:
+#
+#   ┌───────────────┐     ┌───────────────┐
+#   │  TCP connect  │ ──► │ TLS handshake │
+#   │  (socket)     │     │ (ssl)         │
+#   └───────┬───────┘     └───────┬───────┘
+#           │                     │
+#      Порт открыт?        Сертификат OK?
+#      ● ONLINE             ● ONLINE
+#      ● OFFLINE            ⚠ DPI BLOCK
+#
+# Почему это важно:
+# DPI (Deep Packet Inspection) блокирует сервисы НЕ на уровне TCP,
+# а на уровне TLS — читая поле SNI (Server Name Indication) в
+# ClientHello и сбрасывая соединение. Поэтому TCP connect проходит
+# успешно, но сервис фактически не работает.
+#
+# Для портов != 443 (напр. DNS на 53) TLS-проверка невозможна,
+# используется только TCP.
 # ============================================================
 
 import socket
+import ssl
 import time
 from PySide6.QtCore import QObject, Signal, QTimer
 
@@ -27,21 +50,22 @@ class NetworkWorker(QObject):
     """Фоновый воркер для проверки доступности хостов.
 
     Работает в отдельном QThread. Периодически проверяет
-    список хостов через TCP socket и отправляет результаты
-    через сигнал host_checked.
+    список хостов через TCP socket (+ TLS для порта 443)
+    и отправляет результаты через сигнал host_checked.
 
     Параметры сигнала host_checked:
         name (str)       — имя хоста из конфига (напр. "Google DNS")
         host (str)       — адрес (напр. "8.8.8.8")
         port (int)       — порт (напр. 53)
-        is_online (bool) — True если хост доступен
+        status (str)     — "online" | "offline" | "dpi_block"
         ping_ms (float)  — время ответа в миллисекундах (0.0 если оффлайн)
     """
 
     # ── Сигналы ──────────────────────────────────────────────
     # Сигнал: результат проверки одного хоста
-    # Аргументы: (name: str, host: str, port: int, is_online: bool, ping_ms: float)
-    host_checked = Signal(str, str, int, bool, float)
+    # Аргументы: (name, host, port, status, ping_ms)
+    # status: "online" | "offline" | "dpi_block"
+    host_checked = Signal(str, str, int, str, float)
 
     # Сигнал: один полный цикл проверки всех хостов завершён
     cycle_finished = Signal()
@@ -87,12 +111,12 @@ class NetworkWorker(QObject):
         """Проверяет все хосты из списка по очереди.
 
         Для каждого хоста:
-        1. Вызывает _check_single_host() для TCP-проверки
+        1. Вызывает _check_single_host() для TCP (+ TLS) проверки
         2. Отправляет результат через сигнал host_checked
         После проверки всех хостов — отправляет cycle_finished.
         """
         for host_info in self._hosts:
-            is_online, ping_ms = self._check_single_host(
+            status, ping_ms = self._check_single_host(
                 host_info["host"], host_info["port"]
             )
             # emit() отправляет данные в UI-поток через очередь событий Qt
@@ -100,51 +124,101 @@ class NetworkWorker(QObject):
                 host_info["name"],
                 host_info["host"],
                 host_info["port"],
-                is_online,
+                status,
                 ping_ms,
             )
         # Все хосты проверены — сообщаем UI, что цикл завершён
         self.cycle_finished.emit()
 
-    def _check_single_host(self, host: str, port: int) -> tuple[bool, float]:
-        """Проверяет доступность одного хоста через TCP-соединение.
+    def _check_single_host(self, host: str, port: int) -> tuple[str, float]:
+        """Проверяет доступность одного хоста.
 
-        Алгоритм:
-        1. Создаём TCP-сокет (AF_INET = IPv4, SOCK_STREAM = TCP)
-        2. Устанавливаем таймаут (чтобы не ждать вечно)
-        3. Пытаемся подключиться к host:port
-        4. Если подключились — хост онлайн, замеряем время
-        5. Если ошибка (таймаут, отказ, DNS не найден) — оффлайн
+        Двухуровневая проверка:
+        1. TCP connect — проверяет, что порт открыт
+        2. TLS handshake (только для порта 443) — проверяет, что
+           TLS-соединение устанавливается (DPI не блокирует SNI)
+
+        Матрица результатов (порт 443):
+        ┌────────────┬──────────────┬──────────────────┐
+        │ TCP        │ TLS          │ Результат        │
+        ├────────────┼──────────────┼──────────────────┤
+        │ ❌ Fail    │ —            │ "offline"        │
+        │ ✅ OK      │ ❌ Fail      │ "dpi_block"      │
+        │ ✅ OK      │ ✅ OK        │ "online"         │
+        └────────────┴──────────────┴──────────────────┘
+
+        Для порта != 443: только TCP → "online" / "offline".
 
         Returns:
-            (is_online: bool, ping_ms: float)
+            (status: str, ping_ms: float)
+            status = "online" | "offline" | "dpi_block"
             ping_ms = 0.0 если хост оффлайн
         """
         try:
-            # Создаём новый TCP-сокет для каждой проверки
+            # ── Уровень 1: TCP connect ──────────────────────
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            # Таймаут: если за N секунд нет ответа — исключение
             sock.settimeout(self._timeout)
 
-            # Засекаем время ДО подключения
             start_time = time.time()
-            # connect_ex() возвращает 0 при успехе, код ошибки при неудаче.
-            # В отличие от connect(), не выбрасывает исключение при ошибке.
             result = sock.connect_ex((host, port))
-            # Считаем время в миллисекундах
-            ping_ms = (time.time() - start_time) * 1000
+            tcp_ms = (time.time() - start_time) * 1000
 
-            # Закрываем сокет — он нам больше не нужен
+            if result != 0:
+                # TCP не подключился → хост полностью недоступен
+                sock.close()
+                return "offline", 0.0
+
+            # ── Уровень 2: TLS handshake (только порт 443) ──
+            if port == 443:
+                try:
+                    ctx = ssl.create_default_context()
+                    # Переустанавливаем таймаут для TLS-фазы
+                    sock.settimeout(self._timeout)
+                    ssock = ctx.wrap_socket(sock, server_hostname=host)
+                    # Общее время = TCP + TLS
+                    total_ms = (time.time() - start_time) * 1000
+                    ssock.close()
+                    return "online", round(total_ms, 1)
+
+                except (ssl.SSLError, ssl.SSLCertVerificationError):
+                    # TLS ошибка: DPI сбросил соединение на этапе
+                    # ClientHello, или подменил сертификат
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    return "dpi_block", round(tcp_ms, 1)
+
+                except (ConnectionResetError, ConnectionAbortedError):
+                    # DPI отправил RST после прочтения SNI
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    return "dpi_block", round(tcp_ms, 1)
+
+                except (socket.timeout, TimeoutError):
+                    # DPI дропнул пакет (нет ответа на ClientHello)
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    return "dpi_block", round(tcp_ms, 1)
+
+                except OSError:
+                    # Прочие сетевые ошибки на TLS-фазе
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    return "dpi_block", round(tcp_ms, 1)
+
+            # ── Порт != 443: только TCP ─────────────────────
             sock.close()
-
-            # result == 0 означает успешное подключение
-            if result == 0:
-                return True, round(ping_ms, 1)
-            else:
-                return False, 0.0
+            return "online", round(tcp_ms, 1)
 
         except (socket.timeout, socket.error, OSError):
             # socket.timeout — сервер не ответил вовремя
             # socket.error   — ошибка сети (нет маршрута, отказ и т.д.)
             # OSError        — общие ошибки ОС (DNS не найден и т.д.)
-            return False, 0.0
+            return "offline", 0.0

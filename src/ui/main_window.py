@@ -12,8 +12,8 @@
 # └─────────────────────────────────────────────────────────┘
 #
 # ┌─────────────────────────────────────────────────────────┐
-# │ РЕЖИМ «АЛЕРТ» (окно перекрыто + есть оффлайн-хосты)    │
-# │ ─ Показывает ТОЛЬКО упавшие хосты                       │
+# │ РЕЖИМ «АЛЕРТ» (окно перекрыто + есть проблемные хосты)  │
+# │ ─ Показывает ТОЛЬКО упавшие / DPI-заблокированные хосты │
 # │ ─ Всплывает поверх всех окон (WindowStaysOnTopHint)     │
 # │ ─ Когда все хосты вернутся — автоматически уходит назад │
 # └─────────────────────────────────────────────────────────┘
@@ -46,12 +46,13 @@ from src.config_manager import load_config
 
 
 # ── Цвета для индикации статуса ────────────────────────────
-COLOR_ONLINE  = QColor(80, 230, 120)    # Зелёный — хост доступен
-COLOR_OFFLINE = QColor(255, 80, 80)     # Красный — хост недоступен
-COLOR_WAITING = QColor(180, 180, 180)   # Серый   — ещё не проверен
-COLOR_BG      = QColor(25, 25, 35, 230) # Фон окна (тёмный, полупрозрачный)
-COLOR_HEADER  = QColor(45, 45, 65)      # Фон заголовка таблицы
-COLOR_ROW_ALT = QColor(35, 35, 50, 200) # Чередующиеся строки
+COLOR_ONLINE    = QColor(80, 230, 120)    # Зелёный  — хост доступен
+COLOR_OFFLINE   = QColor(255, 80, 80)     # Красный  — хост недоступен
+COLOR_DPI_BLOCK = QColor(255, 200, 60)    # Жёлтый   — TCP ок, TLS заблокирован (DPI)
+COLOR_WAITING   = QColor(180, 180, 180)   # Серый    — ещё не проверен
+COLOR_BG        = QColor(25, 25, 35, 230) # Фон окна (тёмный, полупрозрачный)
+COLOR_HEADER    = QColor(45, 45, 65)      # Фон заголовка таблицы
+COLOR_ROW_ALT   = QColor(35, 35, 50, 200) # Чередующиеся строки
 
 # Стиль кнопок заголовка (общий для шестерёнки, пина и крестика)
 _HEADER_BTN_STYLE = """
@@ -335,26 +336,30 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════
 
     def update_host_status(self, name: str, host: str, port: int,
-                           is_online: bool, ping_ms: float):
+                           status: str, ping_ms: float):
         """Слот: обновляет статус одного хоста.
 
         Подключается к сигналу host_checked воркера.
         Qt автоматически маршрутизирует вызов в главный поток
         (queued connection).
+
+        Args:
+            status: "online" | "offline" | "dpi_block"
         """
         self._host_statuses[name] = {
             "host": host, "port": port,
-            "is_online": is_online, "ping_ms": ping_ms,
+            "status": status, "ping_ms": ping_ms,
         }
         self._refresh_table()
 
     def _refresh_table(self):
-        """Перерисовывает таблицу: все хосты или только оффлайн."""
+        """Перерисовывает таблицу: все хосты или только проблемные."""
         if self._alert_mode:
+            # В алертном режиме показываем только проблемные хосты
             hosts_to_show = [
                 h for h in self._hosts
                 if h["name"] in self._host_statuses
-                and not self._host_statuses[h["name"]]["is_online"]
+                and self._host_statuses[h["name"]]["status"] != "online"
             ]
         else:
             hosts_to_show = self._hosts
@@ -363,31 +368,42 @@ class MainWindow(QMainWindow):
 
         for row, host_info in enumerate(hosts_to_show):
             name = host_info["name"]
-            status = self._host_statuses.get(name)
+            data = self._host_statuses.get(name)
 
             name_item = QTableWidgetItem(name)
             name_item.setForeground(QColor(220, 220, 220))
             self.table.setItem(row, 0, name_item)
 
-            if status:
-                is_online = status["is_online"]
-                ping_ms = status["ping_ms"]
+            if data:
+                status = data["status"]
+                ping_ms = data["ping_ms"]
 
-                if is_online:
+                if status == "online":
                     s_item = QTableWidgetItem("● ONLINE")
                     s_item.setForeground(COLOR_ONLINE)
-                else:
+                elif status == "dpi_block":
+                    s_item = QTableWidgetItem("⚠ DPI BLOCK")
+                    s_item.setForeground(COLOR_DPI_BLOCK)
+                else:  # "offline"
                     s_item = QTableWidgetItem("● OFFLINE")
                     s_item.setForeground(COLOR_OFFLINE)
                 s_item.setTextAlignment(Qt.AlignCenter)
                 self.table.setItem(row, 1, s_item)
 
-                ping_text = f"{ping_ms} ms" if is_online else "—"
+                # Пинг: online → время, dpi_block → "TCP OK", offline → "—"
+                if status == "online":
+                    ping_text = f"{ping_ms} ms"
+                    ping_color = QColor(160, 220, 180)
+                elif status == "dpi_block":
+                    ping_text = "TCP OK"
+                    ping_color = COLOR_DPI_BLOCK
+                else:
+                    ping_text = "—"
+                    ping_color = QColor(120, 120, 120)
+
                 p_item = QTableWidgetItem(ping_text)
                 p_item.setTextAlignment(Qt.AlignCenter)
-                p_item.setForeground(
-                    QColor(160, 220, 180) if is_online else QColor(120, 120, 120)
-                )
+                p_item.setForeground(ping_color)
                 self.table.setItem(row, 2, p_item)
             else:
                 s_item = QTableWidgetItem("⏳")
@@ -400,11 +416,16 @@ class MainWindow(QMainWindow):
                 p_item.setForeground(QColor(120, 120, 120))
                 self.table.setItem(row, 2, p_item)
 
+            # Фон строк: алертный красный / чередование
             for col in range(3):
                 item = self.table.item(row, col)
                 if item:
                     if self._alert_mode:
-                        item.setBackground(QColor(80, 20, 20, 180))
+                        # DPI BLOCK — тёмно-жёлтый фон, OFFLINE — красный
+                        if data and data["status"] == "dpi_block":
+                            item.setBackground(QColor(80, 60, 10, 180))
+                        else:
+                            item.setBackground(QColor(80, 20, 20, 180))
                     elif row % 2 == 1:
                         item.setBackground(COLOR_ROW_ALT)
 
@@ -418,13 +439,14 @@ class MainWindow(QMainWindow):
         """Вызывается UI-таймером каждые 150 мс.
 
         Матрица решений:
-        ┌──────────────┬────────────────┬───────────────────────┐
-        │              │ Есть макс.окно │ Нет макс.окна         │
-        ├──────────────┼────────────────┼───────────────────────┤
-        │ Есть оффлайн │ АЛЕРТ          │ НОРМАЛЬНЫЙ            │
-        │ Всё онлайн   │ (без алерта)   │ НОРМАЛЬНЫЙ            │
-        └──────────────┴────────────────┴───────────────────────┘
+        ┌────────────────────┬────────────────┬───────────────────┐
+        │                    │ Есть макс.окно │ Нет макс.окна     │
+        ├────────────────────┼────────────────┼───────────────────┤
+        │ Есть проблемные    │ АЛЕРТ          │ НОРМАЛЬНЫЙ        │
+        │ Всё онлайн         │ (без алерта)   │ НОРМАЛЬНЫЙ        │
+        └────────────────────┴────────────────┴───────────────────┘
 
+        Проблемные = offline ИЛИ dpi_block.
         В режиме рабочего стола (_desktop_mode) алерты не срабатывают.
         """
         # Защита от мерцания: не переключаемся чаще чем раз в секунду
@@ -435,12 +457,13 @@ class MainWindow(QMainWindow):
         if self._desktop_mode:
             return
 
-        has_offline = any(
-            not s["is_online"] for s in self._host_statuses.values()
+        # Проблемный хост = offline или dpi_block
+        has_problems = any(
+            s["status"] != "online" for s in self._host_statuses.values()
         )
         is_covered = self._is_covered()
 
-        if is_covered and has_offline:
+        if is_covered and has_problems:
             if not self._alert_mode:
                 self._enter_alert_mode()
         else:
@@ -448,7 +471,7 @@ class MainWindow(QMainWindow):
                 self._exit_alert_mode()
 
     def _enter_alert_mode(self):
-        """Включает алерт: поверх всех окон, только оффлайн-хосты."""
+        """Включает алерт: поверх всех окон, только проблемные хосты."""
         self._alert_mode = True
         self._last_mode_switch = time.time()
 
